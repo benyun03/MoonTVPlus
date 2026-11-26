@@ -41,6 +41,10 @@ import {
 } from '@/lib/danmaku/selection-memory';
 import { cleanEpisodeDisplayName } from '@/lib/danmaku/format';
 import {
+  decideSourceSwapByDuration,
+  readHlsLevelTotalDuration,
+} from '@/lib/hls-source-swap';
+import {
   getCachedDanmakuEpisodes,
   setCachedDanmakuEpisodes,
 } from '@/lib/danmaku/episodes-cache';
@@ -4316,6 +4320,19 @@ function PlayPageClient() {
         currentTime
       );
 
+      // [时长守卫] 换源前记录旧链接与旧时长：续期只应更换签名地址，不应更换内容。
+      // 网盘挂载转码源重新解析可能拿到只含部分内容的 m3u8（如 24 分钟只剩 14 分钟），
+      // 不校验会导致播放中途时长缩水、后半集无法播放。
+      const previousSrc = typeof video.src === 'string' ? video.src : '';
+      const previousHlsUrl =
+        hls && typeof hls.url === 'string' ? hls.url : '';
+      const oldDuration =
+        (previousSrc || previousHlsUrl) &&
+        Number.isFinite(video.duration) &&
+        video.duration > 0
+          ? video.duration
+          : Infinity;
+
       // 优先走 HLS 换源；没有 hls 实例时按 progressive 直链处理
       if (hls && typeof hls.loadSource === 'function') {
         try {
@@ -4336,6 +4353,11 @@ function PlayPageClient() {
             } catch {
               // ignore
             }
+            try {
+              hls.off(HlsEvents.LEVEL_LOADED, onLevelLoaded);
+            } catch {
+              // ignore
+            }
             window.clearTimeout(timeoutId);
           };
 
@@ -4344,6 +4366,109 @@ function PlayPageClient() {
             finished = true;
             finishLinkRefresh(isScheduled, hls, video);
             resolve();
+          };
+
+          const restorePlayback = (acceptSwap: boolean, rejectReason?: Error) => {
+            if (currentTime > 0) {
+              try {
+                video.currentTime = currentTime;
+              } catch {
+                // ignore
+              }
+            }
+
+            const afterSeek = () => {
+              console.log('[链接刷新] HLS 刷新完成，恢复到:', video.currentTime);
+              if (!isPaused) {
+                video.play().catch((err) => {
+                  console.warn('[链接刷新] 自动播放失败:', err);
+                });
+              } else {
+                video.pause();
+              }
+              if (acceptSwap) {
+                complete();
+              } else {
+                reject(rejectReason || new Error('新链接内容异常'));
+              }
+            };
+
+            if (currentTime > 0) {
+              video.addEventListener('seeked', afterSeek, { once: true });
+              // seeked 偶发不触发时兜底
+              window.setTimeout(() => {
+                afterSeek();
+              }, 1500);
+            } else {
+              afterSeek();
+            }
+          };
+
+          const scheduleRestore = (acceptSwap: boolean, rejectReason?: Error) => {
+            if (video.readyState >= 2) {
+              restorePlayback(acceptSwap, rejectReason);
+            } else {
+              video.addEventListener('loadeddata', () => {
+                restorePlayback(acceptSwap, rejectReason);
+              }, { once: true });
+              window.setTimeout(() => {
+                restorePlayback(acceptSwap, rejectReason);
+              }, 3000);
+            }
+          };
+
+          let evaluated = false;
+          let levelLoadTimeoutId = 0;
+
+          // [时长守卫] 校验新链接时长；明显截断时回滚到原链接继续播放
+          const evaluateNewSource = (newDuration: number | null) => {
+            if (evaluated) return;
+            evaluated = true;
+            try {
+              hls.off(HlsEvents.LEVEL_LOADED, onLevelLoaded);
+            } catch {
+              // ignore
+            }
+            window.clearTimeout(levelLoadTimeoutId);
+
+            const decision = decideSourceSwapByDuration(
+              oldDuration,
+              newDuration
+            );
+            if (decision.accept || !previousHlsUrl) {
+              scheduleRestore(true);
+              return;
+            }
+
+            console.warn(
+              `[链接刷新] 新链接时长异常(${decision.reason})，回滚到原链接继续播放`
+            );
+            try {
+              hls.stopLoad();
+            } catch {
+              // ignore
+            }
+            try {
+              hls.loadSource(previousHlsUrl);
+              try {
+                hls.startLoad(currentTime);
+              } catch {
+                // ignore
+              }
+            } catch {
+              // ignore
+            }
+            scheduleRestore(
+              false,
+              new Error(`刷新后的链接疑似内容截断(${decision.reason})，已回滚原链接`)
+            );
+          };
+
+          const onLevelLoaded = (
+            _evt: unknown,
+            data: { details?: { totalduration?: number } }
+          ) => {
+            evaluateNewSource(data?.details?.totalduration ?? null);
           };
 
           const onManifestParsed = () => {
@@ -4357,46 +4482,17 @@ function PlayPageClient() {
               // ignore
             }
 
-            const restorePlayback = () => {
-              if (currentTime > 0) {
-                try {
-                  video.currentTime = currentTime;
-                } catch {
-                  // ignore
-                }
-              }
-
-              const afterSeek = () => {
-                console.log('[链接刷新] HLS 刷新完成，恢复到:', video.currentTime);
-                if (!isPaused) {
-                  video.play().catch((err) => {
-                    console.warn('[链接刷新] 自动播放失败:', err);
-                  });
-                } else {
-                  video.pause();
-                }
-                complete();
-              };
-
-              if (currentTime > 0) {
-                video.addEventListener('seeked', afterSeek, { once: true });
-                // seeked 偶发不触发时兜底
-                window.setTimeout(() => {
-                  afterSeek();
-                }, 1500);
-              } else {
-                afterSeek();
-              }
-            };
-
-            if (video.readyState >= 2) {
-              restorePlayback();
-            } else {
-              video.addEventListener('loadeddata', restorePlayback, { once: true });
-              window.setTimeout(() => {
-                restorePlayback();
-              }, 3000);
+            const levelDuration = readHlsLevelTotalDuration(hls);
+            if (levelDuration !== null) {
+              evaluateNewSource(levelDuration);
+              return;
             }
+
+            // master 播放列表等场景 MANIFEST_PARSED 时 details 未就绪，等一次 LEVEL_LOADED 再判定
+            hls.on(HlsEvents.LEVEL_LOADED, onLevelLoaded);
+            levelLoadTimeoutId = window.setTimeout(() => {
+              evaluateNewSource(null); // 读不到时长时放行，避免误伤正常续期
+            }, 4000);
           };
 
           hls.once(HlsEvents.MANIFEST_PARSED, onManifestParsed);
@@ -4434,6 +4530,20 @@ function PlayPageClient() {
           settled = true;
           cleanup();
 
+          // [时长守卫] 直链换源同样校验时长；明显截断时回滚到原链接继续播放
+          const decision = decideSourceSwapByDuration(oldDuration, video.duration);
+          if (!decision.accept && previousSrc) {
+            console.warn(
+              `[链接刷新] 直链时长异常(${decision.reason})，回滚到原链接继续播放`
+            );
+            try {
+              video.src = previousSrc;
+              video.load();
+            } catch {
+              // ignore
+            }
+          }
+
           if (currentTime > 0) {
             try {
               video.currentTime = currentTime;
@@ -4451,7 +4561,13 @@ function PlayPageClient() {
             } else {
               video.pause();
             }
-            complete();
+            if (decision.accept || !previousSrc) {
+              complete();
+            } else {
+              reject(
+                new Error(`刷新后的直链疑似内容截断(${decision.reason})，已回滚原链接`)
+              );
+            }
           };
 
           if (currentTime > 0) {
