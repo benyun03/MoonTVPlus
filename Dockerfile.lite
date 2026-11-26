@@ -1,37 +1,52 @@
+# 与 package.json 的 packageManager 保持一致，避免 pnpm@latest 随时间漂移
+# 破坏 lockfile 兼容性与层缓存
+ARG PNPM_VERSION=10.14.0
+
 # ---- 第 1 阶段：安装依赖 ----
 FROM node:24-alpine AS deps
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+ARG PNPM_VERSION
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml ./
+# pnpm-workspace.yaml 必须一并复制：其中 onlyBuiltDependencies 是 pnpm 10 的
+# 构建脚本白名单（better-sqlite3 原生模块），缺失会导致原生绑定缺失。
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
-RUN pnpm install --frozen-lockfile
+# BuildKit 缓存挂载共享 pnpm store，重复构建无需重新下载全部依赖
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --store-dir /pnpm/store
 
 # ---- 第 2 阶段：构建项目 ----
 FROM node:24-alpine AS builder
-RUN corepack enable && corepack prepare pnpm@latest --activate
+
+ARG PNPM_VERSION
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+
 WORKDIR /app
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-
+ENV NEXT_TELEMETRY_DISABLED=1
 ENV DOCKER_ENV=true
 ENV MOONTV_LITE=true
 ENV WATCH_ROOM_ENABLED=false
 ENV WATCH_ROOM_SERVER_TYPE=external
 ENV OFFLINE_DOWNLOAD_DIR=/data
 
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# lite 使用 standalone 自带的 server.js（会内联 NEXT_PRIVATE_STANDALONE_CONFIG，
+# 跳过需要 compiled/webpack 的配置解析路径），因此无需补齐 NFT 未追踪的 next 内部产物。
 RUN pnpm run build
 
 # ---- 第 3 阶段：生成 lite 运行时镜像 ----
 FROM node:24-alpine AS runner
 
-# 安装 su-exec，用于在 entrypoint 中降权运行
-RUN apk add --no-cache su-exec
-
-RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
+# 安装 su-exec（entrypoint 降权运行用）并创建非 root 用户
+RUN apk add --no-cache su-exec \
+    && addgroup -g 1001 -S nodejs \
+    && adduser -u 1001 -S nextjs -G nodejs
 
 # 复制 entrypoint（支持通过 PUID/PGID 环境变量指定运行 UID/GID）
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
@@ -47,7 +62,7 @@ ENV WATCH_ROOM_ENABLED=false
 ENV WATCH_ROOM_SERVER_TYPE=external
 ENV OFFLINE_DOWNLOAD_DIR=/data
 
-# standalone 输出自带运行所需的最小服务端依赖
+# standalone 输出自带按需追踪的最小运行时依赖
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
 COPY --from=builder --chown=nextjs:nodejs /app/start.js ./start.js

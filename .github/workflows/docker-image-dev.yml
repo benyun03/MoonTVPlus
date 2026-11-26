@@ -97,6 +97,9 @@ jobs:
           # 更改：使用 meta 步骤生成的标签和 labels
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 利用 GitHub Actions 缓存层：依赖未变时跳过安装，仅源码变化时增量构建
+          cache-from: type=gha,scope=moontvplus-${{ env.PLATFORM_NAME }}
+          cache-to: type=gha,mode=max,scope=moontvplus-${{ env.PLATFORM_NAME }}
           # 更改：使用动态镜像名
           outputs: type=image,name=${{ env.IMAGE_NAME }},name-canonical=true,push=true
 

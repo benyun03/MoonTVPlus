@@ -80,6 +80,10 @@ jobs:
           tags: |
             ghcr.io/mtvpls/moontvplus:${{ steps.version.outputs.version }}
             ghcr.io/mtvpls/moontvplus:${{ github.event.inputs.tag || 'latest' }}
+          # 利用 GitHub Actions 缓存层：依赖未变时跳过安装，仅源码变化时增量构建。
+          # 两个平台在不同 runner 上构建，scope 按平台隔离避免缓存互相覆盖
+          cache-from: type=gha,scope=moontvplus-${{ env.PLATFORM_NAME }}
+          cache-to: type=gha,mode=max,scope=moontvplus-${{ env.PLATFORM_NAME }}
           outputs: type=image,name=ghcr.io/mtvpls/moontvplus,name-canonical=true,push=true
 
       - name: Export digest

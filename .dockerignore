@@ -7,3 +7,19 @@ public/screenshot3.png
 # Android/TV native app sources are not needed in Docker image builds
 apps/
 mocks/
+
+# 版本库与 CI 配置不参与镜像构建：减小构建上下文体积，加快上传，
+# 也避免 COPY . . 把无关文件带入 builder 阶段
+.git/
+.github/
+node_modules/
+.next/
+.data/
+.npm/
+coverage/
+.vercel/
+.open-next/
+.edgeone/
+.wrangler/
+Dockerfile*
+docker-compose*.yml
