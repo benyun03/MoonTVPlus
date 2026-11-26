@@ -41,7 +41,10 @@ import {
 } from '@/lib/danmaku/selection-memory';
 import { cleanEpisodeDisplayName } from '@/lib/danmaku/format';
 import {
+  TruncatedSourceRollbackError,
   decideSourceSwapByDuration,
+  isDurationConsistentWithKnownTotal,
+  isTruncatedSourceRollbackError,
   readHlsLevelTotalDuration,
 } from '@/lib/hls-source-swap';
 import {
@@ -75,6 +78,7 @@ import { appendSpecialSourceParam, isSpecialSourceContext } from '@/lib/special-
 import {
   buildEpisodeProgressContentKey,
   loadLocalEpisodeProgress,
+  loadLocalEpisodeProgressRecord,
   pruneLocalEpisodeProgressStorage,
   saveLocalEpisodeProgress,
 } from '@/lib/episode-progress';
@@ -2365,6 +2369,16 @@ function PlayPageClient() {
 
   // 用于记录是否需要在播放器 ready 后跳转到指定进度
   const resumeTimeRef = useRef<number | null>(null);
+  // 当前剧集已知的历史总时长（播放记录/本地单集进度里的较大者）。
+  // 首次加载若实际时长明显小于该值，说明解析到了截断源（如网盘转码 24 分钟只剩 14 分钟），
+  // 同时防止进度保存把 total_time 越写越小。
+  const knownTotalTimeRef = useRef<number>(0);
+  // 入口截断自愈：首次加载检测到截断源后，延迟重新解析一次的定时器与状态
+  const entryTruncationHealTimerRef = useRef<number>(0);
+  const entryTruncationHealScheduledRef = useRef<boolean>(false);
+  const entryTruncationHealDoneRef = useRef<boolean>(false);
+  // 续期换源时长守卫回滚后的重试计数（回滚 ≠ 刷新失败，不占用销毁级重试次数）
+  const truncationRefreshRetryRef = useRef<number>(0);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -4217,6 +4231,7 @@ function PlayPageClient() {
         : '链接已过期并自动刷新';
     }
     retryCountRef.current = 0;
+    truncationRefreshRetryRef.current = 0;
     startRefreshTimer(preferredHls, preferredVideo);
   };
 
@@ -4460,7 +4475,7 @@ function PlayPageClient() {
             }
             scheduleRestore(
               false,
-              new Error(`刷新后的链接疑似内容截断(${decision.reason})，已回滚原链接`)
+              new TruncatedSourceRollbackError(decision.reason)
             );
           };
 
@@ -4564,9 +4579,7 @@ function PlayPageClient() {
             if (decision.accept || !previousSrc) {
               complete();
             } else {
-              reject(
-                new Error(`刷新后的直链疑似内容截断(${decision.reason})，已回滚原链接`)
-              );
+              reject(new TruncatedSourceRollbackError(decision.reason));
             }
           };
 
@@ -4608,6 +4621,28 @@ function PlayPageClient() {
     } catch (error) {
       console.error('[链接刷新] 刷新失败:', error);
       setIsRefreshingUrl(false);
+
+      // [时长守卫] 截断回滚 ≠ 刷新失败：原链接已恢复、可继续播放。
+      // 不销毁播放器、不占用错误重试次数，拉长间隔再试（网盘转码可能随后补全）。
+      if (isTruncatedSourceRollbackError(error)) {
+        retryCountRef.current = Math.max(0, retryCountRef.current - 1);
+        if (truncationRefreshRetryRef.current < 3) {
+          truncationRefreshRetryRef.current++;
+          console.warn(
+            `[链接刷新] 已回滚原链接，5分钟后重试 (${truncationRefreshRetryRef.current}/3)`
+          );
+          setTimeout(() => {
+            if (currentXiaoyaUrlRef.current && shouldEnableLinkRefresh()) {
+              refreshXiaoyaUrl(preferredHls, preferredVideo, true);
+            }
+          }, 5 * 60 * 1000);
+        } else {
+          console.warn(
+            '[链接刷新] 截断回滚重试已达上限，保持原链接继续播放'
+          );
+        }
+        return false;
+      }
 
       // 如果是定时刷新失败，不显示错误（继续使用旧链接）
       if (isScheduled) {
@@ -4716,7 +4751,13 @@ function PlayPageClient() {
     // 重置刷新相关状态
     retryCountRef.current = 0;
     lastRefreshTimeRef.current = 0;
+    truncationRefreshRetryRef.current = 0;
     currentXiaoyaUrlRef.current = ''; // 清空旧的原始URL
+    // 重置入口截断自愈状态（换源/切集视为新的一次加载）
+    window.clearTimeout(entryTruncationHealTimerRef.current);
+    entryTruncationHealTimerRef.current = 0;
+    entryTruncationHealScheduledRef.current = false;
+    entryTruncationHealDoneRef.current = false;
     linkRefreshEligibleRef.current = false;
     clearRefreshTimer(); // 清除旧的定时器
     isInitialLoadRef.current = true; // 重置为首次加载
@@ -6485,6 +6526,22 @@ function PlayPageClient() {
           }
         }
 
+        // 记录已知的历史总时长：续播同集取播放记录 total_time，其余取本地单集进度。
+        // 首次加载据此识别截断源（转码未完成时 m3u8 只有部分时长），保存进度时也用它兜底。
+        const sameEpisodeAsRecord =
+          record && initialIndex === record.index - 1
+            ? record.total_time || 0
+            : 0;
+        const localEpisodeTotal =
+          loadLocalEpisodeProgressRecord(
+            detailEpisodeProgressContentKey,
+            initialIndex
+          )?.totalTime || 0;
+        knownTotalTimeRef.current = Math.max(
+          sameEpisodeAsRecord,
+          localEpisodeTotal
+        );
+
         // 更新当前选集索引
         if (initialIndex < detailData.episodes.length && initialIndex >= 0) {
           setCurrentEpisodeIndex(initialIndex);
@@ -6784,6 +6841,22 @@ function PlayPageClient() {
             targetIndex
           );
       resumeTimeRef.current = resumeTime;
+      // 同集换源沿用已知总时长；换了集号则以新集的本地进度为准
+      if (isSameEpisodeSwitch) {
+        knownTotalTimeRef.current = Math.max(
+          knownTotalTimeRef.current,
+          loadLocalEpisodeProgressRecord(
+            newEpisodeProgressContentKey,
+            targetIndex
+          )?.totalTime || 0
+        );
+      } else {
+        knownTotalTimeRef.current =
+          loadLocalEpisodeProgressRecord(
+            newEpisodeProgressContentKey,
+            targetIndex
+          )?.totalTime || 0;
+      }
 
       // 更新URL参数（不刷新页面）
       const newUrl = new URL(window.location.href);
@@ -6830,11 +6903,15 @@ function PlayPageClient() {
 
       if (isSameEpisodeSwitch && resumeTime && resumeTime > 1) {
         const currentDuration = artPlayerRef.current?.duration || 0;
+        const migratedTotalTime = Math.max(
+          Math.floor(currentDuration),
+          knownTotalTimeRef.current
+        );
         saveLocalEpisodeProgress(
           newEpisodeProgressContentKey,
           targetIndex,
           resumeTime,
-          currentDuration
+          migratedTotalTime
         );
 
         try {
@@ -6846,7 +6923,7 @@ function PlayPageClient() {
             index: targetIndex + 1,
             total_episodes: newDetail.episodes?.length || 1,
             play_time: Math.floor(resumeTime),
-            total_time: Math.floor(currentDuration),
+            total_time: migratedTotalTime,
             save_time: Date.now(),
             search_title: searchTitle,
             // 换到 tvbox 的某条线路时一起记下来（同集换源时原记录才会迁移）
@@ -6974,13 +7051,23 @@ function PlayPageClient() {
       // 否则重建播放器后进度停在 0、音量回到 0.7。
       const currentPlayTime = artPlayerRef.current?.currentTime || 0;
       prepareEpisodeSwitch();
-      resumeTimeRef.current =
-        targetIndex === currentEpisodeIndexRef.current && currentPlayTime > 1
-          ? currentPlayTime
-          : loadLocalEpisodeProgress(
-              episodeProgressContentKey,
-              targetIndex
-            );
+      if (
+        targetIndex === currentEpisodeIndexRef.current &&
+        currentPlayTime > 1
+      ) {
+        resumeTimeRef.current = currentPlayTime;
+      } else {
+        resumeTimeRef.current = loadLocalEpisodeProgress(
+          episodeProgressContentKey,
+          targetIndex
+        );
+        // 换了集号，已知总时长以新集的本地单集进度为准
+        knownTotalTimeRef.current =
+          loadLocalEpisodeProgressRecord(
+            episodeProgressContentKey,
+            targetIndex
+          )?.totalTime || 0;
+      }
 
       // URL 带上网选线路，分享/刷新都从这条线路进
       const newUrl = new URL(window.location.href);
@@ -7000,7 +7087,10 @@ function PlayPageClient() {
             index: targetIndex + 1,
             total_episodes: lineInfo.episodes.length,
             play_time: Math.max(0, Math.floor(currentPlayTime)),
-            total_time: Math.floor(artPlayerRef.current?.duration || 0),
+            total_time: Math.max(
+              Math.floor(artPlayerRef.current?.duration || 0),
+              knownTotalTimeRef.current
+            ),
             search_title: searchTitle,
           }),
           index: targetIndex + 1,
@@ -7073,7 +7163,8 @@ function PlayPageClient() {
         episodeProgressContentKey,
         currentEpisodeIndexRef.current,
         currentTime,
-        duration
+        // [时长守卫] 与历史已知总时长取大者，防止截断源把单集记录越写越小
+        Math.max(Math.floor(duration), knownTotalTimeRef.current)
       );
     } catch (error) {
       console.warn('[Play] Failed to save local episode progress before episode switch:', error);
@@ -7083,6 +7174,7 @@ function PlayPageClient() {
   const primeEpisodeResumeState = (targetEpisodeIndex: number) => {
     if (!currentSourceRef.current || !currentIdRef.current) {
       resumeTimeRef.current = null;
+      knownTotalTimeRef.current = 0;
       return;
     }
 
@@ -7092,6 +7184,12 @@ function PlayPageClient() {
       episodeProgressContentKey,
       targetEpisodeIndex
     );
+    // 新集数的已知总时长以本地单集进度为准，不沿用上一集的值
+    knownTotalTimeRef.current =
+      loadLocalEpisodeProgressRecord(
+        episodeProgressContentKey,
+        targetEpisodeIndex
+      )?.totalTime || 0;
   };
 
   const prepareEpisodeSwitch = () => {
@@ -7959,6 +8057,10 @@ function PlayPageClient() {
       return;
     }
 
+    // [时长守卫] 截断源（转码未完成等）会把 duration 越写越小、吞掉真实总时长。
+    // total_time 只增不减：与历史已知值取大者，防止 25 分钟的记录被 14 分钟的流覆盖。
+    const totalTime = Math.max(Math.floor(duration), knownTotalTimeRef.current);
+
     const saveKey = JSON.stringify([
       currentSourceRef.current, currentIdRef.current, currentEpisodeIndexRef.current,
       getActiveTVBoxBridgeLine(detailRef.current)?.name, playTime,
@@ -7972,7 +8074,7 @@ function PlayPageClient() {
         episodeProgressContentKey,
         currentEpisodeIndexRef.current,
         currentTime,
-        duration
+        totalTime
       );
 
       await savePlayRecord(currentSourceRef.current, currentIdRef.current, {
@@ -7983,7 +8085,7 @@ function PlayPageClient() {
         index: currentEpisodeIndexRef.current + 1, // 转换为1基索引
         total_episodes: detailRef.current?.episodes.length || 1,
         play_time: playTime,
-        total_time: Math.floor(duration),
+        total_time: totalTime,
         save_time: Date.now(),
         search_title: searchTitle,
         is_anime: isAnimeCategoryText(
@@ -8002,11 +8104,12 @@ function PlayPageClient() {
 
       lastSavedPlayRecordKeyRef.current = saveKey;
       lastSaveTimeRef.current = Date.now();
+      knownTotalTimeRef.current = totalTime;
       console.log('播放进度已保存:', {
         title: videoTitleRef.current,
         episode: currentEpisodeIndexRef.current + 1,
         year: detailRef.current?.year,
-        progress: `${Math.floor(currentTime)}/${Math.floor(duration)}`,
+        progress: `${playTime}/${totalTime}`,
       });
     } catch (err) {
       console.error('保存播放进度失败:', err);
@@ -10674,23 +10777,98 @@ function PlayPageClient() {
         // 监听视频可播放事件，这时恢复播放进度更可靠
         artPlayerRef.current.on('video:canplay', () => {
           let restoredResumeTime = false;
+          let preserveResumeTime = false;
 
           // 若存在需要恢复的播放进度，则跳转
           if (resumeTimeRef.current && resumeTimeRef.current > 0) {
             try {
               const duration = artPlayerRef.current.duration || 0;
-              let target = resumeTimeRef.current;
-              if (duration && target >= duration - 2) {
-                target = Math.max(0, duration - 5);
+              const knownTotal = knownTotalTimeRef.current;
+              const truncatedSource =
+                !isDurationConsistentWithKnownTotal(knownTotal, duration);
+
+              if (truncatedSource) {
+                // [时长守卫-入口] 本次解析出的是截断源（如转码未完成的 24 分钟只剩 14 分钟），
+                // 续播点会被浏览器钳到片尾。先保留续播点，延迟重新解析一次；
+                // 重解析成功后 canplay 会再次触发，那时时长恢复即可跳回原续播点。
+                const formatTime = (seconds: number) => {
+                  const m = Math.floor(seconds / 60);
+                  const s = Math.floor(seconds % 60);
+                  return `${m}:${s.toString().padStart(2, '0')}`;
+                };
+                console.warn(
+                  `[Play] 片源时长异常: 实际 ${formatTime(duration)}，预期 ${formatTime(knownTotal)}，疑似截断源`
+                );
+
+                const canHeal =
+                  currentXiaoyaUrlRef.current &&
+                  shouldEnableLinkRefresh() &&
+                  !entryTruncationHealScheduledRef.current;
+
+                if (canHeal) {
+                  entryTruncationHealScheduledRef.current = true;
+                  if (artPlayerRef.current.notice) {
+                    artPlayerRef.current.notice.show =
+                      '片源时长异常，正在尝试重新解析完整片源…';
+                  }
+                  window.clearTimeout(entryTruncationHealTimerRef.current);
+                  entryTruncationHealTimerRef.current = window.setTimeout(
+                    () => {
+                      if (!artPlayerRef.current) return;
+                      refreshXiaoyaUrl(undefined, undefined, true).finally(
+                        () => {
+                          // 重解析结束后若时长仍异常，下一次 canplay 走兜底钳位
+                          entryTruncationHealDoneRef.current = true;
+                        }
+                      );
+                    },
+                    60 * 1000
+                  );
+                  // 自愈期间不做续播跳转，避免钳到片尾触发连播/覆盖进度；保留 resumeTimeRef
+                  preserveResumeTime = true;
+                } else if (
+                  entryTruncationHealScheduledRef.current &&
+                  !entryTruncationHealDoneRef.current
+                ) {
+                  // 自愈已排程但尚未完成（等待重解析换源），同样先不动续播点
+                  preserveResumeTime = true;
+                } else {
+                  // 无法自愈（源不支持续期）或已重解析仍截断：
+                  // 按原行为钳到片尾附近，并给出提示
+                  console.warn(
+                    '[Play] 片源不完整且无法自动恢复，按当前时长恢复进度'
+                  );
+                  if (artPlayerRef.current.notice) {
+                    artPlayerRef.current.notice.show =
+                      '该片源暂不完整，仅能播放部分内容，可稍后重试或换线路';
+                  }
+                  let fallbackTarget = resumeTimeRef.current;
+                  if (duration && fallbackTarget >= duration - 2) {
+                    fallbackTarget = Math.max(0, duration - 5);
+                  }
+                  artPlayerRef.current.currentTime = fallbackTarget;
+                  restoredResumeTime = true;
+                }
+              } else {
+                // 时长正常（或无历史记录可比）：加载到的完整时长并入已知值
+                if (duration > knownTotalTimeRef.current) {
+                  knownTotalTimeRef.current = duration;
+                }
+                let target = resumeTimeRef.current;
+                if (duration && target >= duration - 2) {
+                  target = Math.max(0, duration - 5);
+                }
+                artPlayerRef.current.currentTime = target;
+                restoredResumeTime = true;
+                console.log('成功恢复播放进度到:', target);
               }
-              artPlayerRef.current.currentTime = target;
-              restoredResumeTime = true;
-              console.log('成功恢复播放进度到:', resumeTimeRef.current);
             } catch (err) {
               console.warn('恢复播放进度失败:', err);
             }
           }
-          resumeTimeRef.current = null;
+          if (!restoredResumeTime && !preserveResumeTime) {
+            resumeTimeRef.current = null;
+          }
 
           const shouldResumePlaying =
             resumePlayingAfterHlsModeSwitchRef.current;

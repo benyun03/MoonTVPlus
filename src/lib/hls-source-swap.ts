@@ -14,6 +14,47 @@ export interface SourceSwapDurationDecision {
 }
 
 /**
+ * 续期换源时长校验未通过、已回滚原链接时抛出的标记错误。
+ * 调用方据此与「刷新真的失败」区分开：回滚成功意味着旧链接仍可播，
+ * 不应走销毁播放器/快速重试的失败路径。
+ */
+export class TruncatedSourceRollbackError extends Error {
+  constructor(reason: string) {
+    super(`刷新后的链接疑似内容截断(${reason})，已回滚原链接`);
+    this.name = 'TruncatedSourceRollbackError';
+  }
+}
+
+export function isTruncatedSourceRollbackError(
+  error: unknown
+): error is TruncatedSourceRollbackError {
+  return (
+    error instanceof Error &&
+    (error instanceof TruncatedSourceRollbackError ||
+      error.name === 'TruncatedSourceRollbackError')
+  );
+}
+
+/**
+ * 首次加载（如从播放记录续播进入）时的时长一致性判断：
+ * 已知该剧集此前的总时长，而本次解析出的流明显更短，说明拿到的是
+ * 截断源（转码未完成/预览流只有部分内容），续播位置会被钳到片尾。
+ * 无已知总时长（首次观看、记录缺失）时不表态。
+ */
+export function isDurationConsistentWithKnownTotal(
+  knownTotal: number,
+  actualDuration: number
+): boolean {
+  if (!Number.isFinite(knownTotal) || knownTotal <= 0) {
+    return true;
+  }
+  if (!Number.isFinite(actualDuration) || actualDuration <= 0) {
+    return true;
+  }
+  return decideSourceSwapByDuration(knownTotal, actualDuration).accept;
+}
+
+/**
  * 依据新旧时长判断是否接受换源。
  * - 任一侧时长未知（live 流为 Infinity、信息缺失等）时放行，避免误伤正常续期。
  * - 新时长在容差内（绝对 5s 或旧时长的 2%，取大者）视为同一内容。

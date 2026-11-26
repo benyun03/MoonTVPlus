@@ -1,5 +1,8 @@
 import {
+  TruncatedSourceRollbackError,
   decideSourceSwapByDuration,
+  isDurationConsistentWithKnownTotal,
+  isTruncatedSourceRollbackError,
   readHlsLevelTotalDuration,
 } from '@/lib/hls-source-swap';
 
@@ -81,5 +84,52 @@ describe('readHlsLevelTotalDuration', () => {
       readHlsLevelTotalDuration({ levels: [{ details: { totalduration: 0 } }] })
     ).toBeNull();
     expect(readHlsLevelTotalDuration({ levels: [{ details: {} }] })).toBeNull();
+  });
+});
+
+describe('isDurationConsistentWithKnownTotal', () => {
+  const T24MIN = 24 * 60 + 7;
+  const T14MIN = 14 * 60 + 1;
+
+  it('无已知总时长时不表态（视为一致）', () => {
+    expect(isDurationConsistentWithKnownTotal(0, T14MIN)).toBe(true);
+    expect(isDurationConsistentWithKnownTotal(NaN, T14MIN)).toBe(true);
+    expect(isDurationConsistentWithKnownTotal(Infinity, T14MIN)).toBe(true);
+  });
+
+  it('实际时长未知时不表态（视为一致）', () => {
+    expect(isDurationConsistentWithKnownTotal(T24MIN, 0)).toBe(true);
+    expect(isDurationConsistentWithKnownTotal(T24MIN, NaN)).toBe(true);
+  });
+
+  it('发现截断源：24 分钟内容只剩 14 分钟', () => {
+    // 回归用例：从播放记录续播进入时解析到截断 m3u8，续播点会被钳到片尾
+    expect(isDurationConsistentWithKnownTotal(T24MIN, T14MIN)).toBe(false);
+    expect(isDurationConsistentWithKnownTotal(T24MIN, T24MIN - 30)).toBe(
+      false
+    );
+  });
+
+  it('时长一致或更长时视为一致', () => {
+    expect(isDurationConsistentWithKnownTotal(T24MIN, T24MIN)).toBe(true);
+    expect(isDurationConsistentWithKnownTotal(T24MIN, T24MIN + 30)).toBe(true);
+    expect(isDurationConsistentWithKnownTotal(T24MIN, T24MIN - 25)).toBe(true);
+  });
+});
+
+describe('TruncatedSourceRollbackError', () => {
+  it('携带标记 name，便于与刷新失败区分', () => {
+    const err = new TruncatedSourceRollbackError(
+      'new_source_truncated: 857.0s < 1447.0s'
+    );
+    expect(err.name).toBe('TruncatedSourceRollbackError');
+    expect(err.message).toContain('已回滚原链接');
+    expect(isTruncatedSourceRollbackError(err)).toBe(true);
+  });
+
+  it('普通错误与异步 reject 的普通 Error 不算回滚', () => {
+    expect(isTruncatedSourceRollbackError(new Error('加载超时'))).toBe(false);
+    expect(isTruncatedSourceRollbackError(null)).toBe(false);
+    expect(isTruncatedSourceRollbackError('x')).toBe(false);
   });
 });
