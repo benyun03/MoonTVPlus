@@ -2383,6 +2383,7 @@ function PlayPageClient() {
   const flapRecoveryLastAtRef = useRef<number>(0);
   const flapRecoveryCountRef = useRef<number>(0);
   const flapRecoveryTimerRef = useRef<number>(0);
+  const flapRetryTimerRef = useRef<number>(0);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -4765,6 +4766,8 @@ function PlayPageClient() {
     // 重置播放中时长缩水恢复状态
     window.clearTimeout(flapRecoveryTimerRef.current);
     flapRecoveryTimerRef.current = 0;
+    window.clearTimeout(flapRetryTimerRef.current);
+    flapRetryTimerRef.current = 0;
     flapRecoveryLastAtRef.current = 0;
     flapRecoveryCountRef.current = 0;
     linkRefreshEligibleRef.current = false;
@@ -8195,6 +8198,47 @@ function PlayPageClient() {
     return false;
   };
 
+  /**
+   * 假结束后的延迟重试：频控冷却后再次尝试恢复；
+   * 若届时时长已恢复但视频停在片尾（假结束的暂停），回退 2 秒续播。
+   */
+  const scheduleFlapRetry = (delayMs = 10500) => {
+    window.clearTimeout(flapRetryTimerRef.current);
+    flapRetryTimerRef.current = window.setTimeout(() => {
+      const player = artPlayerRef.current;
+      const video = player?.video as HTMLVideoElement | undefined;
+      if (!player || !video) {
+        return;
+      }
+      const shrunk = !isDurationConsistentWithKnownTotal(
+        knownTotalTimeRef.current,
+        video.duration
+      );
+      if (shrunk) {
+        if (!tryRecoverTruncatedPlaylist('ended-retry')) {
+          if (flapRecoveryCountRef.current < 5) {
+            scheduleFlapRetry();
+          }
+        }
+        return;
+      }
+      // 时长已恢复但停在片尾：回退续播
+      if (video.paused) {
+        try {
+          video.currentTime = Math.max(0, video.currentTime - 2);
+          video.play().catch(() => {
+            // ignore
+          });
+          if (player.notice) {
+            player.notice.show = '片源已恢复完整，继续播放';
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }, delayMs);
+  };
+
   useEffect(() => {
     // 页面即将卸载时保存播放进度和清理资源
     const handleBeforeUnload = () => {
@@ -11381,7 +11425,8 @@ function PlayPageClient() {
           }
 
           // [时长守卫] 假结束：播到的是 CDN 旧缓存截断列表的边缘（时长明显小于历史总时长），
-          // 不是真的播完了。先尝试恢复完整片源并回退续播，不切下一集。
+          // 不是真的播完了。无论恢复是否被频控，一律不自动切集：
+          // 立即恢复 / 冷却后重试 / 次数用尽则停下提示，避免把用户从本集切走。
           const endedVideo = artPlayerRef.current?.video as
             | HTMLVideoElement
             | undefined;
@@ -11397,9 +11442,17 @@ function PlayPageClient() {
                 artPlayerRef.current.notice.show =
                   '片源被截断（CDN 旧缓存），已尝试恢复完整片源';
               }
-              return;
+            } else if (flapRecoveryCountRef.current < 5) {
+              if (artPlayerRef.current.notice) {
+                artPlayerRef.current.notice.show =
+                  '片源被截断（CDN 旧缓存），稍后自动重试恢复';
+              }
+              scheduleFlapRetry();
+            } else if (artPlayerRef.current.notice) {
+              artPlayerRef.current.notice.show =
+                '片源不完整（CDN 旧缓存），已停止自动连播，可稍后重试或手动换集';
             }
-            // 恢复不可用（次数用尽/非HLS）：按原逻辑继续，避免卡死在片尾
+            return;
           }
 
           const d = detailRef.current;
