@@ -48,6 +48,7 @@ import {
   readHlsLevelTotalDuration,
 } from '@/lib/hls-source-swap';
 import { createCacheBustingPlaylistLoader } from '@/lib/hls-playlist-cache-bust.client';
+import { makeCacheBustValue } from '@/lib/hls-playlist-cache-bust.client';
 import {
   getCachedDanmakuEpisodes,
   setCachedDanmakuEpisodes,
@@ -2387,6 +2388,9 @@ function PlayPageClient() {
   const flapRetryTimerRef = useRef<number>(0);
   // 手动「刷新片源」防抖
   const lastManualPlaylistRefreshAtRef = useRef<number>(0);
+  // [缓存穿透] 平时关闭（吃 CDN 默认缓存，稳定）；仅在缩水恢复/手动刷新时开启
+  // （回源采新桶）。源站偶发「回源数据比 CDN 旧缓存更差」，常开会造成降级。
+  const playlistBustModeRef = useRef<boolean>(false);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -4773,6 +4777,8 @@ function PlayPageClient() {
     flapRetryTimerRef.current = 0;
     flapRecoveryLastAtRef.current = 0;
     flapRecoveryCountRef.current = 0;
+    // 新集数/新源默认关闭穿透，回归 CDN 默认缓存
+    playlistBustModeRef.current = false;
     linkRefreshEligibleRef.current = false;
     clearRefreshTimer(); // 清除旧的定时器
     isInitialLoadRef.current = true; // 重置为首次加载
@@ -8161,6 +8167,8 @@ function PlayPageClient() {
     }
     flapRecoveryLastAtRef.current = now;
     flapRecoveryCountRef.current++;
+    // 开启穿透：本次及后续播放列表请求采样新缓存桶，直到时长恢复一致
+    playlistBustModeRef.current = true;
 
     const fmt = (s: number) =>
       `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
@@ -8253,6 +8261,8 @@ function PlayPageClient() {
       return;
     }
     lastManualPlaylistRefreshAtRef.current = now;
+    // 手动刷新即明确要求拿最新数据：开启穿透采新桶
+    playlistBustModeRef.current = true;
 
     const player = artPlayerRef.current;
     const video = player?.video as HTMLVideoElement | undefined;
@@ -8953,11 +8963,13 @@ function PlayPageClient() {
                 loaderClass = Hls.DefaultConfig.loader;
               }
 
-              // [缓存穿透] 播放列表（m3u8）请求追加一次性参数，采样新缓存桶：
-              // 部分资源站 CDN 边缘节点会短暂保留转码未完成时的截断列表（时长缩水），
-              // 反复请求同一 URL 只会反复命中同一个坏桶。只改写 m3u8 请求，
-              // 分片照常吃缓存；签名链接由 shouldBustPlaylistCache 自动跳过。
-              loaderClass = createCacheBustingPlaylistLoader(loaderClass);
+              // [缓存穿透] 条件启用：平时吃 CDN 默认缓存；进入「缩水恢复」或
+              // 手动「刷新片源」时开启穿透（每次 m3u8 请求带一次性参数采样新缓存桶）。
+              // 只改写 m3u8 请求，分片照常吃缓存；签名链接自动跳过。
+              loaderClass = createCacheBustingPlaylistLoader(
+                loaderClass,
+                () => (playlistBustModeRef.current ? makeCacheBustValue() : '')
+              );
 
               const hls = new Hls({
                 debug: false, // 关闭日志
@@ -10425,6 +10437,8 @@ function PlayPageClient() {
             )
           ) {
             window.clearTimeout(flapRecoveryTimerRef.current);
+            // 时长已恢复一致：关闭穿透，回归 CDN 默认缓存
+            playlistBustModeRef.current = false;
             return;
           }
           const fmt = (s: number) =>
