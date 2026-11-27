@@ -10847,6 +10847,9 @@ function PlayPageClient() {
                     fallbackTarget = Math.max(0, duration - 5);
                   }
                   artPlayerRef.current.currentTime = fallbackTarget;
+                  // 立即消费续播点：canplay 在缓冲期间会反复触发，
+                  // 不清空会导致每次 canplay 都重新 seek，画面无限回跳
+                  resumeTimeRef.current = null;
                   restoredResumeTime = true;
                 }
               } else {
@@ -10859,6 +10862,8 @@ function PlayPageClient() {
                   target = Math.max(0, duration - 5);
                 }
                 artPlayerRef.current.currentTime = target;
+                // 立即消费续播点，同上：不清空会引发无限 seek 循环
+                resumeTimeRef.current = null;
                 restoredResumeTime = true;
                 console.log('成功恢复播放进度到:', target);
               }
