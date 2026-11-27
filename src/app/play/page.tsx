@@ -47,6 +47,7 @@ import {
   isTruncatedSourceRollbackError,
   readHlsLevelTotalDuration,
 } from '@/lib/hls-source-swap';
+import { createCacheBustingPlaylistLoader } from '@/lib/hls-playlist-cache-bust.client';
 import {
   getCachedDanmakuEpisodes,
   setCachedDanmakuEpisodes,
@@ -2384,6 +2385,8 @@ function PlayPageClient() {
   const flapRecoveryCountRef = useRef<number>(0);
   const flapRecoveryTimerRef = useRef<number>(0);
   const flapRetryTimerRef = useRef<number>(0);
+  // 手动「刷新片源」防抖
+  const lastManualPlaylistRefreshAtRef = useRef<number>(0);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -8239,6 +8242,73 @@ function PlayPageClient() {
     }, delayMs);
   };
 
+  /**
+   * [手动] 强制重新拉取片源播放列表。配合缓存穿透 loader，
+   * 每次重拉都会带上一次性参数采样新缓存桶；原地换源不重开播放器，
+   * 保持进度与播放状态，弱影响。
+   */
+  const forceRefreshPlaylistManually = () => {
+    const now = Date.now();
+    if (now - lastManualPlaylistRefreshAtRef.current < 3000) {
+      return;
+    }
+    lastManualPlaylistRefreshAtRef.current = now;
+
+    const player = artPlayerRef.current;
+    const video = player?.video as HTMLVideoElement | undefined;
+    const hls = (
+      video as unknown as {
+        hls?: {
+          url?: string;
+          loadSource?: (u: string) => void;
+          startLoad?: (p?: number) => void;
+          stopLoad?: () => void;
+        };
+      }
+    )?.hls;
+
+    if (!player || !video) {
+      return;
+    }
+
+    if (
+      hls &&
+      typeof hls.loadSource === 'function' &&
+      typeof hls.url === 'string' &&
+      hls.url
+    ) {
+      const resumeAt = video.currentTime;
+      const wasPaused = video.paused;
+      try {
+        hls.stopLoad?.();
+      } catch {
+        // ignore
+      }
+      try {
+        hls.loadSource(hls.url);
+        hls.startLoad?.(resumeAt);
+      } catch {
+        // ignore
+      }
+      try {
+        video.currentTime = resumeAt;
+        if (!wasPaused) {
+          video.play().catch(() => {
+            // ignore
+          });
+        }
+      } catch {
+        // ignore
+      }
+      if (player.notice) {
+        player.notice.show = '已重新拉取片源数据';
+      }
+      console.log('[Play] 手动强制刷新片源播放列表');
+    } else if (player.notice) {
+      player.notice.show = '当前片源不支持刷新';
+    }
+  };
+
   useEffect(() => {
     // 页面即将卸载时保存播放进度和清理资源
     const handleBeforeUnload = () => {
@@ -8883,6 +8953,12 @@ function PlayPageClient() {
                 loaderClass = Hls.DefaultConfig.loader;
               }
 
+              // [缓存穿透] 播放列表（m3u8）请求追加一次性参数，采样新缓存桶：
+              // 部分资源站 CDN 边缘节点会短暂保留转码未完成时的截断列表（时长缩水），
+              // 反复请求同一 URL 只会反复命中同一个坏桶。只改写 m3u8 请求，
+              // 分片照常吃缓存；签名链接由 shouldBustPlaylistCache 自动跳过。
+              loaderClass = createCacheBustingPlaylistLoader(loaderClass);
+
               const hls = new Hls({
                 debug: false, // 关闭日志
                 enableWorker: true, // WebWorker 解码，降低主线程压力
@@ -9102,6 +9178,15 @@ function PlayPageClient() {
               '<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCIgdmlld0JveD0iMCAwIDUwIDUwIj48cGF0aCBkPSJNMjUuMjUxIDYuNDYxYy0xMC4zMTggMC0xOC42ODMgOC4zNjUtMTguNjgzIDE4LjY4M2g0LjA2OGMwLTguMDcgNi41NDUtMTQuNjE1IDE0LjYxNS0xNC42MTVWNi40NjF6IiBmaWxsPSIjMDA5Njg4Ij48YW5pbWF0ZVRyYW5zZm9ybSBhdHRyaWJ1dGVOYW1lPSJ0cmFuc2Zvcm0iIGF0dHJpYnV0ZVR5cGU9IlhNTCIgZHVyPSIxcyIgZnJvbT0iMCAyNSAyNSIgcmVwZWF0Q291bnQ9ImluZGVmaW5pdGUiIHRvPSIzNjAgMjUgMjUiIHR5cGU9InJvdGF0ZSIvPjwvcGF0aD48L3N2Zz4=">',
           },
           settings: [
+            {
+              html: '刷新片源',
+              icon: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M17.65 6.35A7.958 7.958 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="#ffffff"/></svg>',
+              tooltip: '时长不对/播不全时点此重拉片源数据',
+              onClick() {
+                forceRefreshPlaylistManually();
+                return '已发起刷新';
+              },
+            },
             {
               html: '去广告',
               icon: '<text x="50%" y="50%" font-size="20" font-weight="bold" text-anchor="middle" dominant-baseline="middle" fill="#ffffff">AD</text>',
