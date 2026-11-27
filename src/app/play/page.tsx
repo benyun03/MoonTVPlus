@@ -2382,14 +2382,14 @@ function PlayPageClient() {
   // 续期换源时长守卫回滚后的重试计数（回滚 ≠ 刷新失败，不占用销毁级重试次数）
   const truncationRefreshRetryRef = useRef<number>(0);
   // 播放中时长缩水恢复（资源站 CDN 新旧缓存抖动：截断列表 ↔ 完整列表）
-  const flapRecoveryLastAtRef = useRef<number>(0);
-  const flapRecoveryCountRef = useRef<number>(0);
   const flapRecoveryTimerRef = useRef<number>(0);
-  const flapRetryTimerRef = useRef<number>(0);
+  // [时长守卫] 自动恢复只做一次的标记：不重试，仍异常时交给手动「刷新片源」
+  const flapRecoveryAttemptedRef = useRef<boolean>(false);
   // 手动「刷新片源」防抖
   const lastManualPlaylistRefreshAtRef = useRef<number>(0);
-  // [缓存穿透] 平时关闭（吃 CDN 默认缓存，稳定）；仅在缩水恢复/手动刷新时开启
-  // （回源采新桶）。源站偶发「回源数据比 CDN 旧缓存更差」，常开会造成降级。
+  // [缓存穿透] 默认关闭（照常吃 CDN 默认缓存）；仅手动「刷新片源」时开启，
+  // 时长恢复一致或切换集数后自动关闭。源站偶发「回源数据比 CDN 旧缓存更差」，
+  // 常开会造成降级，因此不做自动穿透。
   const playlistBustModeRef = useRef<boolean>(false);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
@@ -4773,11 +4773,8 @@ function PlayPageClient() {
     // 重置播放中时长缩水恢复状态
     window.clearTimeout(flapRecoveryTimerRef.current);
     flapRecoveryTimerRef.current = 0;
-    window.clearTimeout(flapRetryTimerRef.current);
-    flapRetryTimerRef.current = 0;
-    flapRecoveryLastAtRef.current = 0;
-    flapRecoveryCountRef.current = 0;
-    // 新集数/新源默认关闭穿透，回归 CDN 默认缓存
+    // 新集数/新源：恢复一次性标记重置，默认关闭穿透
+    flapRecoveryAttemptedRef.current = false;
     playlistBustModeRef.current = false;
     linkRefreshEligibleRef.current = false;
     clearRefreshTimer(); // 清除旧的定时器
@@ -8140,8 +8137,8 @@ function PlayPageClient() {
   /**
    * [时长守卫-播放中] 资源站 CDN 可能在「转码截断列表」和「完整列表」两份缓存间抖动：
    * 命中旧缓存时 video.duration 缩水（如 24:09 → 14:12），播到缩水边缘会被当成
-   * 「播放结束」误触自动连播。这里强制重载同一播放列表（新请求大概率命中新缓存），
-   * 恢复完整时长。带频控：10s 间隔、每集最多 5 次。
+   * 「播放结束」误触自动连播。检测到缩水后强制重载一次播放列表，并开启缓存穿透
+   * 采样新缓存桶。只做一次、不重试；仍异常时由用户手动「刷新片源」处理。
    */
   const tryRecoverTruncatedPlaylist = (reason: string): boolean => {
     const player = artPlayerRef.current;
@@ -8157,23 +8154,19 @@ function PlayPageClient() {
     if (isDurationConsistentWithKnownTotal(knownTotal, duration)) {
       return false;
     }
-    const now = Date.now();
-    if (now - flapRecoveryLastAtRef.current < 10000) {
+    // 本集已自动处理过一次：不重试，交由手动「刷新片源」
+    if (flapRecoveryAttemptedRef.current) {
+      console.warn('[Play] 时长缩水自动恢复已做过一次，跳过；可手动「刷新片源」');
       return false;
     }
-    if (flapRecoveryCountRef.current >= 5) {
-      console.warn('[Play] 时长缩水恢复次数已达上限，放弃自动恢复');
-      return false;
-    }
-    flapRecoveryLastAtRef.current = now;
-    flapRecoveryCountRef.current++;
-    // 开启穿透：本次及后续播放列表请求采样新缓存桶，直到时长恢复一致
+    flapRecoveryAttemptedRef.current = true;
+    // 开启穿透：本次重载的播放列表请求采样新缓存桶
     playlistBustModeRef.current = true;
 
     const fmt = (s: number) =>
       `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
     console.warn(
-      `[Play] 片源时长缩水(${reason}): 当前 ${fmt(duration)}，预期 ${fmt(knownTotal)}，强制重载播放列表 (#${flapRecoveryCountRef.current})`
+      `[Play] 片源时长缩水(${reason}): 当前 ${fmt(duration)}，预期 ${fmt(knownTotal)}，强制重载播放列表（仅此一次）`
     );
 
     if (
@@ -8207,47 +8200,6 @@ function PlayPageClient() {
 
     // 非 HLS（直链）没有可重载的播放列表，交回调用方按原逻辑处理
     return false;
-  };
-
-  /**
-   * 假结束后的延迟重试：频控冷却后再次尝试恢复；
-   * 若届时时长已恢复但视频停在片尾（假结束的暂停），回退 2 秒续播。
-   */
-  const scheduleFlapRetry = (delayMs = 10500) => {
-    window.clearTimeout(flapRetryTimerRef.current);
-    flapRetryTimerRef.current = window.setTimeout(() => {
-      const player = artPlayerRef.current;
-      const video = player?.video as HTMLVideoElement | undefined;
-      if (!player || !video) {
-        return;
-      }
-      const shrunk = !isDurationConsistentWithKnownTotal(
-        knownTotalTimeRef.current,
-        video.duration
-      );
-      if (shrunk) {
-        if (!tryRecoverTruncatedPlaylist('ended-retry')) {
-          if (flapRecoveryCountRef.current < 5) {
-            scheduleFlapRetry();
-          }
-        }
-        return;
-      }
-      // 时长已恢复但停在片尾：回退续播
-      if (video.paused) {
-        try {
-          video.currentTime = Math.max(0, video.currentTime - 2);
-          video.play().catch(() => {
-            // ignore
-          });
-          if (player.notice) {
-            player.notice.show = '片源已恢复完整，继续播放';
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }, delayMs);
   };
 
   /**
@@ -8963,9 +8915,9 @@ function PlayPageClient() {
                 loaderClass = Hls.DefaultConfig.loader;
               }
 
-              // [缓存穿透] 条件启用：平时吃 CDN 默认缓存；进入「缩水恢复」或
-              // 手动「刷新片源」时开启穿透（每次 m3u8 请求带一次性参数采样新缓存桶）。
-              // 只改写 m3u8 请求，分片照常吃缓存；签名链接自动跳过。
+              // [缓存穿透] 仅手动「刷新片源」时启用：每次 m3u8 请求带一次性参数
+              // 采样新缓存桶。平时（含自动恢复重载）关闭，照常吃 CDN 默认缓存。
+              // 只改写 m3u8 请求，分片不受影响；签名链接自动跳过。
               loaderClass = createCacheBustingPlaylistLoader(
                 loaderClass,
                 () => (playlistBustModeRef.current ? makeCacheBustValue() : '')
@@ -11524,8 +11476,8 @@ function PlayPageClient() {
           }
 
           // [时长守卫] 假结束：播到的是 CDN 旧缓存截断列表的边缘（时长明显小于历史总时长），
-          // 不是真的播完了。无论恢复是否被频控，一律不自动切集：
-          // 立即恢复 / 冷却后重试 / 次数用尽则停下提示，避免把用户从本集切走。
+          // 不是真的播完了。一律不自动切集：自动恢复只做一次，
+          // 仍异常则提示手动「刷新片源」，避免把用户从本集切走。
           const endedVideo = artPlayerRef.current?.video as
             | HTMLVideoElement
             | undefined;
@@ -11539,17 +11491,11 @@ function PlayPageClient() {
             if (tryRecoverTruncatedPlaylist('ended')) {
               if (artPlayerRef.current.notice) {
                 artPlayerRef.current.notice.show =
-                  '片源被截断（CDN 旧缓存），已尝试恢复完整片源';
+                  '片源被截断（CDN 缓存异常），已尝试恢复完整片源';
               }
-            } else if (flapRecoveryCountRef.current < 5) {
-              if (artPlayerRef.current.notice) {
-                artPlayerRef.current.notice.show =
-                  '片源被截断（CDN 旧缓存），稍后自动重试恢复';
-              }
-              scheduleFlapRetry();
             } else if (artPlayerRef.current.notice) {
               artPlayerRef.current.notice.show =
-                '片源不完整（CDN 旧缓存），已停止自动连播，可稍后重试或手动换集';
+                '片源不完整且自动恢复无效，请在设置中使用「刷新片源」重试';
             }
             return;
           }
