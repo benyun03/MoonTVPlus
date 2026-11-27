@@ -2379,6 +2379,10 @@ function PlayPageClient() {
   const entryTruncationHealDoneRef = useRef<boolean>(false);
   // 续期换源时长守卫回滚后的重试计数（回滚 ≠ 刷新失败，不占用销毁级重试次数）
   const truncationRefreshRetryRef = useRef<number>(0);
+  // 播放中时长缩水恢复（资源站 CDN 新旧缓存抖动：截断列表 ↔ 完整列表）
+  const flapRecoveryLastAtRef = useRef<number>(0);
+  const flapRecoveryCountRef = useRef<number>(0);
+  const flapRecoveryTimerRef = useRef<number>(0);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -4758,6 +4762,11 @@ function PlayPageClient() {
     entryTruncationHealTimerRef.current = 0;
     entryTruncationHealScheduledRef.current = false;
     entryTruncationHealDoneRef.current = false;
+    // 重置播放中时长缩水恢复状态
+    window.clearTimeout(flapRecoveryTimerRef.current);
+    flapRecoveryTimerRef.current = 0;
+    flapRecoveryLastAtRef.current = 0;
+    flapRecoveryCountRef.current = 0;
     linkRefreshEligibleRef.current = false;
     clearRefreshTimer(); // 清除旧的定时器
     isInitialLoadRef.current = true; // 重置为首次加载
@@ -8116,6 +8125,76 @@ function PlayPageClient() {
     }
   };
 
+  /**
+   * [时长守卫-播放中] 资源站 CDN 可能在「转码截断列表」和「完整列表」两份缓存间抖动：
+   * 命中旧缓存时 video.duration 缩水（如 24:09 → 14:12），播到缩水边缘会被当成
+   * 「播放结束」误触自动连播。这里强制重载同一播放列表（新请求大概率命中新缓存），
+   * 恢复完整时长。带频控：10s 间隔、每集最多 5 次。
+   */
+  const tryRecoverTruncatedPlaylist = (reason: string): boolean => {
+    const player = artPlayerRef.current;
+    const video = player?.video as HTMLVideoElement | undefined;
+    const hls = (video as unknown as { hls?: { url?: string; loadSource?: (u: string) => void; startLoad?: (p?: number) => void; stopLoad?: () => void } })?.hls;
+    const knownTotal = knownTotalTimeRef.current;
+    const duration = video?.duration || 0;
+
+    if (!video || !knownTotal || !duration) {
+      return false;
+    }
+    // 时长已恢复正常，无需处理
+    if (isDurationConsistentWithKnownTotal(knownTotal, duration)) {
+      return false;
+    }
+    const now = Date.now();
+    if (now - flapRecoveryLastAtRef.current < 10000) {
+      return false;
+    }
+    if (flapRecoveryCountRef.current >= 5) {
+      console.warn('[Play] 时长缩水恢复次数已达上限，放弃自动恢复');
+      return false;
+    }
+    flapRecoveryLastAtRef.current = now;
+    flapRecoveryCountRef.current++;
+
+    const fmt = (s: number) =>
+      `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+    console.warn(
+      `[Play] 片源时长缩水(${reason}): 当前 ${fmt(duration)}，预期 ${fmt(knownTotal)}，强制重载播放列表 (#${flapRecoveryCountRef.current})`
+    );
+
+    if (
+      hls &&
+      typeof hls.loadSource === 'function' &&
+      typeof hls.url === 'string' &&
+      hls.url
+    ) {
+      const resumeAt = Math.max(0, video.currentTime - 2);
+      try {
+        hls.stopLoad?.();
+      } catch {
+        // ignore
+      }
+      try {
+        hls.loadSource(hls.url);
+        hls.startLoad?.(resumeAt);
+      } catch {
+        // ignore
+      }
+      try {
+        video.currentTime = resumeAt;
+        video.play().catch(() => {
+          // ignore
+        });
+      } catch {
+        // ignore
+      }
+      return true;
+    }
+
+    // 非 HLS（直链）没有可重载的播放列表，交回调用方按原逻辑处理
+    return false;
+  };
+
   useEffect(() => {
     // 页面即将卸载时保存播放进度和清理资源
     const handleBeforeUnload = () => {
@@ -10203,6 +10282,41 @@ function PlayPageClient() {
           releaseWakeLock();
         });
 
+        // [时长守卫] 播放中时长缩水监控：CDN 命中旧缓存截断列表时 duration 会突然变小。
+        // 给 hls.js 自身的列表刷新 12s 自愈窗口，仍未恢复则强制重载播放列表。
+        artPlayerRef.current.on('video:durationchange', () => {
+          const video = artPlayerRef.current?.video as
+            | HTMLVideoElement
+            | undefined;
+          if (!video) return;
+          if (
+            isDurationConsistentWithKnownTotal(
+              knownTotalTimeRef.current,
+              video.duration
+            )
+          ) {
+            window.clearTimeout(flapRecoveryTimerRef.current);
+            return;
+          }
+          const fmt = (s: number) =>
+            `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+          console.warn(
+            `[Play] 检测到播放中时长缩水: ${fmt(video.duration)}（预期 ${fmt(knownTotalTimeRef.current)}）`
+          );
+          window.clearTimeout(flapRecoveryTimerRef.current);
+          flapRecoveryTimerRef.current = window.setTimeout(() => {
+            const stillShrunk =
+              artPlayerRef.current?.video &&
+              !isDurationConsistentWithKnownTotal(
+                knownTotalTimeRef.current,
+                (artPlayerRef.current.video as HTMLVideoElement).duration
+              );
+            if (stillShrunk) {
+              tryRecoverTruncatedPlaylist('durationchange');
+            }
+          }, 12000);
+        });
+
         // 如果播放器初始化时已经在播放状态，则请求 Wake Lock
         if (artPlayerRef.current && !artPlayerRef.current.paused) {
           requestWakeLock();
@@ -11264,6 +11378,28 @@ function PlayPageClient() {
               artPlayerRef.current.notice.show = '等待房主切换下一集';
             }
             return;
+          }
+
+          // [时长守卫] 假结束：播到的是 CDN 旧缓存截断列表的边缘（时长明显小于历史总时长），
+          // 不是真的播完了。先尝试恢复完整片源并回退续播，不切下一集。
+          const endedVideo = artPlayerRef.current?.video as
+            | HTMLVideoElement
+            | undefined;
+          if (
+            endedVideo &&
+            !isDurationConsistentWithKnownTotal(
+              knownTotalTimeRef.current,
+              endedVideo.duration
+            )
+          ) {
+            if (tryRecoverTruncatedPlaylist('ended')) {
+              if (artPlayerRef.current.notice) {
+                artPlayerRef.current.notice.show =
+                  '片源被截断（CDN 旧缓存），已尝试恢复完整片源';
+              }
+              return;
+            }
+            // 恢复不可用（次数用尽/非HLS）：按原逻辑继续，避免卡死在片尾
           }
 
           const d = detailRef.current;
